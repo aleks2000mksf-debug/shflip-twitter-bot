@@ -676,12 +676,16 @@ async def _get_x_user_id(
     headers = {"Authorization": f"Bearer {bearer_token}"}
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
         if response.status != 200:
+            body = await response.text()
+            logger.warning("X API user lookup failed for @%s: %s %s", username, response.status, body[:200])
             return None
         payload = await response.json()
 
     user_id = payload.get("data", {}).get("id")
     if user_id:
         _user_id_cache[username.lower()] = user_id
+    else:
+        logger.warning("X API user lookup returned no data for @%s", username)
     return user_id
 
 
@@ -834,8 +838,10 @@ async def fetch_tweets(
 ) -> tuple[list[Tweet], str | None]:
     if config["x_bearer_token"]:
         tweets, newest_id = await fetch_tweets_x_api(session, username, config, since_id)
-        if tweets or newest_id:
-            return tweets, newest_id
+        if tweets:
+            logger.info("Fetched %s tweets for @%s via X API", len(tweets), username)
+        return tweets, newest_id
+
     tweets = await fetch_tweets_nitter(session, username, config)
     if not tweets:
         return [], None
