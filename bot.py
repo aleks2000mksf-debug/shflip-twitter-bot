@@ -31,33 +31,33 @@ POST_FOOTER = (
 )
 
 
+def _x_user_link(username: str) -> str:
+    profile = f"https://twitter.com/{username}"
+    return f'<a href="{html.escape(profile)}">@{html.escape(username)}</a>'
+
+
 def format_header(tweet: Tweet) -> str:
-    author = html.escape(tweet.username)
+    author_link = _x_user_link(tweet.username)
     if tweet.kind == "retweet" and tweet.related_username:
-        target = html.escape(tweet.related_username)
+        target_link = _x_user_link(tweet.related_username)
         return (
-            f"🔁 <b>Репост · @{target}</b>\n"
-            f"<i>от @{author}</i>"
+            f"🔁 <b>Репост · {target_link}</b>\n"
+            f"<i>от {author_link}</i>"
         )
     if tweet.kind == "reply" and tweet.related_username:
-        target = html.escape(tweet.related_username)
+        target_link = _x_user_link(tweet.related_username)
         return (
-            f"↩️ <b>Ответ · @{target}</b>\n"
-            f"<i>от @{author}</i>"
+            f"↩️ <b>Ответ · {target_link}</b>\n"
+            f"<i>от {author_link}</i>"
         )
-    return f"📝 <b>@{author}</b>"
+    return f"📝 <b>{author_link}</b>"
 
 
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     header = format_header(tweet)
     body = await translate_to_russian(tweet.text, proxy_url)
     quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
-    return (
-        f"{header}\n\n"
-        f"{quoted}\n\n"
-        f'<a href="{html.escape(tweet.link)}">Открыть в X</a>\n\n'
-        f"{POST_FOOTER}"
-    )
+    return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
 
 
 def create_bot(token: str, proxy_url: str | None) -> Bot:
