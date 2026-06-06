@@ -4,11 +4,11 @@
   "target_thread_id": 36238,
   "check_interval": 30,
   "accounts": [
-    "elonmusk",
     "durov",
     "shflips",
     "bitget",
-    "zachxbt"
+    "zachxbt",
+    "pumpdotfun"
   ],
   "keywords_filter": [],
   "exclude_retweets": false,
