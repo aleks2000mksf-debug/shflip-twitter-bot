@@ -1,6 +1,7 @@
 {
   "bot_token": "your_bot_token_here",
   "target_chat_id": "-1001234567890",
+  "target_thread_id": 36238,
   "check_interval": 30,
   "accounts": [
     "elonmusk",

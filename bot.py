@@ -149,6 +149,12 @@ def create_bot(token: str, proxy_url: str | None) -> Bot:
     return Bot(token=token, session=AiohttpSession(timeout=120))
 
 
+def _thread_kwargs(thread_id: int | None) -> dict:
+    if thread_id:
+        return {"message_thread_id": thread_id}
+    return {}
+
+
 async def _download_media(url: str, proxy_url: str | None, filename: str) -> BufferedInputFile:
     timeout = aiohttp.ClientTimeout(total=120)
     if proxy_url:
@@ -197,6 +203,7 @@ async def _send_video(
     text: str,
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
+    thread_id: int | None,
 ) -> None:
     video = await _media_input(video_item, proxy_url, allow_download=True)
     try:
@@ -206,6 +213,7 @@ async def _send_video(
             caption=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
+            **_thread_kwargs(thread_id),
         )
         return
     except Exception:
@@ -219,6 +227,7 @@ async def _send_video(
             caption=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
+            **_thread_kwargs(thread_id),
         )
 
 
@@ -229,6 +238,7 @@ async def _send_photo(
     text: str,
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
+    thread_id: int | None,
 ) -> None:
     photo = await _media_input(photo_item, proxy_url, allow_download=False)
     try:
@@ -238,6 +248,7 @@ async def _send_photo(
             caption=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
+            **_thread_kwargs(thread_id),
         )
         return
     except Exception:
@@ -251,6 +262,7 @@ async def _send_photo(
             caption=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
+            **_thread_kwargs(thread_id),
         )
 
 
@@ -261,6 +273,7 @@ async def _send_photo_album(
     text: str,
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
+    thread_id: int | None,
 ) -> None:
     media_group: list[InputMediaPhoto] = []
     for index, photo_item in enumerate(photos):
@@ -277,7 +290,11 @@ async def _send_photo_album(
             media_group.append(InputMediaPhoto(media=photo))
 
     try:
-        await bot.send_media_group(chat_id=chat_id, media=media_group)
+        await bot.send_media_group(
+            chat_id=chat_id,
+            media=media_group,
+            **_thread_kwargs(thread_id),
+        )
     except Exception:
         logger.warning("Retrying photo album with downloaded files")
         media_group = []
@@ -293,27 +310,38 @@ async def _send_photo_album(
                 )
             else:
                 media_group.append(InputMediaPhoto(media=photo))
-        await bot.send_media_group(chat_id=chat_id, media=media_group)
+        await bot.send_media_group(
+            chat_id=chat_id,
+            media=media_group,
+            **_thread_kwargs(thread_id),
+        )
 
     await bot.send_message(
         chat_id=chat_id,
         text="\u200b",
         reply_markup=markup,
+        **_thread_kwargs(thread_id),
     )
 
 
-async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None) -> None:
+async def send_tweet(
+    bot: Bot,
+    chat_id: str,
+    tweet: Tweet,
+    proxy_url: str | None,
+    thread_id: int | None = None,
+) -> None:
     text = await format_tweet(tweet, proxy_url)
     markup = build_reply_markup(tweet)
     photos = [item for item in tweet.media if item.kind == "photo"]
     videos = [item for item in tweet.media if item.kind == "video"]
 
     if videos:
-        await _send_video(bot, chat_id, videos[0], text, markup, proxy_url)
+        await _send_video(bot, chat_id, videos[0], text, markup, proxy_url, thread_id)
     elif len(photos) == 1:
-        await _send_photo(bot, chat_id, photos[0], text, markup, proxy_url)
+        await _send_photo(bot, chat_id, photos[0], text, markup, proxy_url, thread_id)
     elif len(photos) > 1:
-        await _send_photo_album(bot, chat_id, photos, text, markup, proxy_url)
+        await _send_photo_album(bot, chat_id, photos, text, markup, proxy_url, thread_id)
     else:
         await bot.send_message(
             chat_id=chat_id,
@@ -321,17 +349,19 @@ async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=markup,
+            **_thread_kwargs(thread_id),
         )
 
 
 async def run_check(bot: Bot, config: dict) -> int:
     chat_id = config["target_chat_id"]
+    thread_id = config.get("target_thread_id")
     if not chat_id:
         logger.warning("target_chat_id is not set in config.json")
         return 0
 
     async def on_new_tweet(tweet: Tweet) -> None:
-        await send_tweet(bot, chat_id, tweet, config["proxy_url"])
+        await send_tweet(bot, chat_id, tweet, config["proxy_url"], thread_id)
 
     return await check_twitter_accounts(config, on_new_tweet=on_new_tweet)
 
@@ -351,6 +381,11 @@ async def main() -> None:
             "Monitoring %s Twitter accounts every %s seconds",
             len(config["accounts"]),
             config["check_interval"],
+        )
+        logger.info(
+            "Publishing to chat=%s thread=%s",
+            config["target_chat_id"],
+            config.get("target_thread_id") or "none",
         )
 
         while True:

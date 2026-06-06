@@ -80,9 +80,14 @@ def load_config() -> dict:
     if nitter_url and nitter_url not in instances:
         instances.insert(0, nitter_url)
 
+    thread_raw = config.get("target_thread_id") or os.getenv("TARGET_THREAD_ID", "")
+    thread_text = str(thread_raw).strip()
+    target_thread_id = int(thread_text) if thread_text.isdigit() else None
+
     return {
         "bot_token": config.get("bot_token") or os.getenv("BOT_TOKEN", ""),
         "target_chat_id": str(config.get("target_chat_id") or os.getenv("TARGET_CHAT_ID", "")),
+        "target_thread_id": target_thread_id,
         "accounts": [account.strip().lstrip("@") for account in config.get("accounts", []) if account],
         "check_interval": max(15, int(config.get("check_interval", 30))),
         "exclude_retweets": bool(config.get("exclude_retweets", False)),
