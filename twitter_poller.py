@@ -173,6 +173,9 @@ def _best_video_url(media: dict) -> str | None:
 
 
 def _extract_media_items(item: dict, payload: dict) -> list[MediaItem]:
+    if not item:
+        return []
+
     media_by_key = {
         media["media_key"]: media
         for media in payload.get("includes", {}).get("media", [])
@@ -192,6 +195,59 @@ def _extract_media_items(item: dict, payload: dict) -> list[MediaItem]:
             if url:
                 items.append(MediaItem("video", url))
     return items
+
+
+def _included_tweets(payload: dict) -> dict[str, dict]:
+    return {
+        str(tweet["id"]): tweet
+        for tweet in payload.get("includes", {}).get("tweets", [])
+        if tweet.get("id") is not None
+    }
+
+
+def _merge_media_items(*groups: list[MediaItem]) -> list[MediaItem]:
+    merged: list[MediaItem] = []
+    seen: set[str] = set()
+    for group in groups:
+        for media_item in group:
+            if media_item.url in seen:
+                continue
+            seen.add(media_item.url)
+            merged.append(media_item)
+    return merged
+
+
+def _collect_media_items(
+    item: dict,
+    payload: dict,
+    kind: str,
+    source_item: dict | None,
+) -> list[MediaItem]:
+    included = _included_tweets(payload)
+    candidates: list[dict] = []
+
+    if kind == "retweet" and source_item:
+        candidates.append(source_item)
+
+    candidates.append(item)
+
+    for ref in item.get("referenced_tweets", []):
+        ref_id = str(ref.get("id", "")).strip()
+        ref_type = ref.get("type")
+        if not ref_id:
+            continue
+        referenced = included.get(ref_id)
+        if not referenced:
+            continue
+        if ref_type == "retweeted":
+            if referenced not in candidates:
+                candidates.insert(0, referenced)
+        elif ref_type in {"quoted", "replied_to"} and referenced not in candidates:
+            candidates.append(referenced)
+
+    return _merge_media_items(
+        *[_extract_media_items(candidate, payload) for candidate in candidates if candidate]
+    )
 
 
 def _normalize_media_url(url: str) -> str:
@@ -254,20 +310,18 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
         return None
 
     users = {user["id"]: user.get("username", "") for user in payload.get("includes", {}).get("users", [])}
-    included_tweets = {
-        tweet["id"]: tweet for tweet in payload.get("includes", {}).get("tweets", [])
-    }
+    included_tweets = _included_tweets(payload)
 
     kind = "post"
     related_username: str | None = None
     item_text = (item.get("text") or "").strip()
     text = item_text
     rt_match = RT_FULL_RE.match(item_text)
-    source_item = item
+    source_item: dict | None = item
 
     for ref in item.get("referenced_tweets", []):
         ref_type = ref.get("type")
-        ref_id = ref.get("id")
+        ref_id = str(ref.get("id", "")).strip()
         if ref_type == "retweeted" and ref_id:
             kind = "retweet"
             original = included_tweets.get(ref_id, {})
@@ -295,12 +349,15 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
             related_username = parsed_related or related_username
 
     if not text:
-        text = _media_label(source_item, payload) or _media_label(item, payload) or ""
+        text = _media_label(source_item or {}, payload) or _media_label(item, payload) or ""
 
-    if not text:
+    media = _collect_media_items(item, payload, kind, source_item)
+
+    if not text and not media:
         return None
 
-    media = _extract_media_items(source_item, payload) or _extract_media_items(item, payload)
+    if not text:
+        text = "📎 Медиа"
 
     return Tweet(
         id=tweet_id,
@@ -354,8 +411,11 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
             continue
 
         kind, related_username, text = _classify_text(body)
-        if not text:
+        media = _extract_media_from_html(description) if description else []
+        if not text and not media:
             continue
+        if not text and media:
+            text = "📎 Медиа"
 
         tweets.append(
             Tweet(
@@ -450,6 +510,63 @@ async def _get_x_user_id(
     return user_id
 
 
+async def _fetch_tweet_by_id(
+    session: aiohttp.ClientSession,
+    tweet_id: str,
+    bearer_token: str,
+) -> tuple[dict | None, dict]:
+    url = (
+        f"https://api.twitter.com/2/tweets/{tweet_id}"
+        "?tweet.fields=attachments,entities,referenced_tweets,text"
+        "&expansions=attachments.media_keys"
+        "&media.fields=preview_image_url,type,url,variants"
+    )
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+        if response.status != 200:
+            return None, {}
+        payload = await response.json()
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None, payload
+    return data, payload
+
+
+async def _ensure_tweet_media(
+    session: aiohttp.ClientSession,
+    item: dict,
+    tweet: Tweet,
+    bearer_token: str,
+) -> None:
+    if tweet.media:
+        return
+
+    tweet_ids: list[str] = []
+    if tweet.kind == "retweet":
+        for ref in item.get("referenced_tweets", []):
+            if ref.get("type") == "retweeted" and ref.get("id"):
+                tweet_ids.append(str(ref["id"]))
+    else:
+        tweet_ids.append(tweet.id)
+        for ref in item.get("referenced_tweets", []):
+            if ref.get("type") == "quoted" and ref.get("id"):
+                tweet_ids.append(str(ref["id"]))
+
+    seen: set[str] = set()
+    for tweet_id in tweet_ids:
+        if not tweet_id or tweet_id in seen:
+            continue
+        seen.add(tweet_id)
+        details, details_payload = await _fetch_tweet_by_id(session, tweet_id, bearer_token)
+        if not details:
+            continue
+        media = _extract_media_items(details, details_payload)
+        if media:
+            tweet.media = media
+            logger.info("Loaded media for tweet %s via tweet lookup", tweet.id)
+            return
+
+
 async def fetch_tweets_x_api(
     session: aiohttp.ClientSession,
     username: str,
@@ -484,10 +601,15 @@ async def fetch_tweets_x_api(
         payload = await response.json()
 
     tweets: list[Tweet] = []
+    raw_items: list[dict] = []
     for item in payload.get("data", []):
         tweet = _parse_x_api_item(item, username, payload)
         if tweet:
             tweets.append(tweet)
+            raw_items.append(item)
+
+    for item, tweet in zip(raw_items, tweets):
+        await _ensure_tweet_media(session, item, tweet, bearer_token)
 
     return tweets
 

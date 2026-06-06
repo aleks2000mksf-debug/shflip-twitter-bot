@@ -102,7 +102,10 @@ PIC_URL_RE = re.compile(
     re.IGNORECASE,
 )
 TCO_URL_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
-MEDIA_PLACEHOLDER_RE = re.compile(r"^(?:🎬\s*Видео|📷\s*Фото|Видео|Фото)$", re.MULTILINE)
+MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^(?:🎬\s*Видео|📷\s*Фото|📎\s*Медиа|Видео|Фото|Медиа)$",
+    re.MULTILINE,
+)
 
 
 def _tidy_text(text: str) -> str:
