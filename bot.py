@@ -6,7 +6,7 @@ import sys
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from twitter_poller import Tweet, check_twitter_accounts, load_config
 
@@ -53,6 +53,22 @@ def format_header(tweet: Tweet) -> str:
     return f"📝 <b>{author_link}</b>"
 
 
+def tweet_button_text(tweet: Tweet) -> str:
+    if tweet.kind == "retweet":
+        return "Открыть репост в X"
+    if tweet.kind == "reply":
+        return "Открыть ответ в X"
+    return "Открыть пост в X"
+
+
+def build_reply_markup(tweet: Tweet) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=tweet_button_text(tweet), url=tweet.link)],
+        ]
+    )
+
+
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     header = format_header(tweet)
     body = await translate_to_russian(tweet.text, proxy_url)
@@ -70,12 +86,14 @@ def create_bot(token: str, proxy_url: str | None) -> Bot:
 
 async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None) -> None:
     text = await format_tweet(tweet, proxy_url)
+    markup = build_reply_markup(tweet)
     if tweet.image_url:
         await bot.send_photo(
             chat_id=chat_id,
             photo=tweet.image_url,
             caption=text,
             parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
     else:
         await bot.send_message(
@@ -83,6 +101,7 @@ async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=markup,
         )
 
 
