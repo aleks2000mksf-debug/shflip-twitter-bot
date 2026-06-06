@@ -1,0 +1,16 @@
+[Unit]
+Description=Shflip Twitter to Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/twitter-telegram-bot
+ExecStart=/opt/twitter-telegram-bot/venv/bin/python /opt/twitter-telegram-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

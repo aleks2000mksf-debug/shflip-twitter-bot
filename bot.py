@@ -1,0 +1,110 @@
+import asyncio
+import html
+import logging
+import sys
+
+from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
+
+from twitter_poller import Tweet, check_twitter_accounts, load_config
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+async def translate_to_russian(text: str, proxy_url: str | None) -> str:
+    def _translate() -> str:
+        from deep_translator import GoogleTranslator
+
+        proxies = None
+        if proxy_url:
+            proxies = {"http": proxy_url, "https": proxy_url}
+        return GoogleTranslator(source="auto", target="ru", proxies=proxies).translate(text)
+
+    return await asyncio.to_thread(_translate)
+
+
+async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
+    body = await translate_to_russian(tweet.text, proxy_url)
+    quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
+    return (
+        f"{quoted}\n\n"
+        f'<a href="{html.escape(tweet.link)}">Открыть в X · @{html.escape(tweet.username)}</a>'
+    )
+
+
+def create_bot(token: str, proxy_url: str | None) -> Bot:
+    if proxy_url:
+        logger.info("Using proxy for Telegram")
+        session = AiohttpSession(proxy=proxy_url, timeout=60)
+        return Bot(token=token, session=session)
+    return Bot(token=token, session=AiohttpSession(timeout=60))
+
+
+async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None) -> None:
+    text = await format_tweet(tweet, proxy_url)
+    if tweet.image_url:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=tweet.image_url,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+async def run_check(bot: Bot, config: dict) -> int:
+    chat_id = config["target_chat_id"]
+    if not chat_id:
+        logger.warning("target_chat_id is not set in config.json")
+        return 0
+
+    async def on_new_tweet(tweet: Tweet) -> None:
+        await send_tweet(bot, chat_id, tweet, config["proxy_url"])
+        await asyncio.sleep(1)
+
+    return await check_twitter_accounts(config, on_new_tweet=on_new_tweet)
+
+
+async def main() -> None:
+    config = load_config()
+    token = config["bot_token"]
+    if not token:
+        raise RuntimeError("bot_token is not set in config.json")
+
+    bot = create_bot(token, config["proxy_url"])
+
+    try:
+        me = await bot.get_me()
+        logger.info("Bot started: @%s", me.username)
+        logger.info(
+            "Monitoring %s Twitter accounts every %s seconds",
+            len(config["accounts"]),
+            config["check_interval"],
+        )
+
+        while True:
+            try:
+                new_count = await run_check(bot, config)
+                logger.info("Check finished, new tweets: %s", new_count)
+            except Exception:
+                logger.exception("Check failed")
+            await asyncio.sleep(config["check_interval"])
+    except TelegramNetworkError as exc:
+        logger.error("Cannot connect to Telegram API: %s", exc)
+        logger.error("Set proxy_url in config.json or enable VPN.")
+        raise SystemExit(1) from exc
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
