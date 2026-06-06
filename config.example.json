@@ -11,9 +11,9 @@
     "zachxbt"
   ],
   "keywords_filter": [],
-  "exclude_retweets": true,
-  "exclude_replies": true,
-  "exclude_quotes": true,
+  "exclude_retweets": false,
+  "exclude_replies": false,
+  "exclude_quotes": false,
   "max_tweets_per_check": 5,
   "bootstrap": true,
   "proxy_url": "",

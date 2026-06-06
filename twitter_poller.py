@@ -92,9 +92,9 @@ def load_config() -> dict:
         "target_thread_id": target_thread_id,
         "accounts": [account.strip().lstrip("@") for account in config.get("accounts", []) if account],
         "check_interval": max(15, int(config.get("check_interval", 30))),
-        "exclude_retweets": bool(config.get("exclude_retweets", True)),
-        "exclude_replies": bool(config.get("exclude_replies", True)),
-        "exclude_quotes": bool(config.get("exclude_quotes", True)),
+        "exclude_retweets": bool(config.get("exclude_retweets", False)),
+        "exclude_replies": bool(config.get("exclude_replies", False)),
+        "exclude_quotes": bool(config.get("exclude_quotes", False)),
         "max_per_check": max(5, int(config.get("max_tweets_per_check", 5))),
         "bootstrap": bool(config.get("bootstrap", True)),
         "keywords_filter": [item.lower() for item in config.get("keywords_filter", []) if item],
@@ -711,14 +711,14 @@ async def fetch_tweets_x_api(
     username: str,
     config: dict,
     since_id: str | None = None,
-) -> list[Tweet]:
+) -> tuple[list[Tweet], str | None]:
     bearer_token = config["x_bearer_token"]
     if not bearer_token:
-        return []
+        return [], None
 
     user_id = await _get_x_user_id(session, username, bearer_token)
     if not user_id:
-        return []
+        return [], None
 
     url = (
         f"https://api.twitter.com/2/users/{user_id}/tweets"
@@ -736,7 +736,7 @@ async def fetch_tweets_x_api(
         if response.status != 200:
             body = await response.text()
             logger.warning("X API error for @%s: %s %s", username, response.status, body[:200])
-            return []
+            return [], None
         payload = await response.json()
 
     tweets: list[Tweet] = []
@@ -751,7 +751,8 @@ async def fetch_tweets_x_api(
         await _ensure_tweet_attribution(session, item, tweet, username, bearer_token)
         await _ensure_tweet_media(session, item, tweet, bearer_token)
 
-    return tweets
+    newest_id = str(payload.get("meta", {}).get("newest_id", "") or "").strip() or None
+    return tweets, newest_id
 
 
 async def fetch_tweets(
@@ -759,12 +760,15 @@ async def fetch_tweets(
     username: str,
     config: dict,
     since_id: str | None = None,
-) -> list[Tweet]:
+) -> tuple[list[Tweet], str | None]:
     if config["x_bearer_token"]:
-        tweets = await fetch_tweets_x_api(session, username, config, since_id)
-        if tweets:
-            return tweets
-    return await fetch_tweets_nitter(session, username, config)
+        tweets, newest_id = await fetch_tweets_x_api(session, username, config, since_id)
+        if tweets or newest_id:
+            return tweets, newest_id
+    tweets = await fetch_tweets_nitter(session, username, config)
+    if not tweets:
+        return [], None
+    return tweets, max(tweets, key=lambda tweet: int(tweet.id)).id
 
 
 async def check_twitter_accounts(
@@ -780,28 +784,36 @@ async def check_twitter_accounts(
     pending_by_account: dict[str, list[Tweet]] = {}
 
     async with await _create_session(config["proxy_url"]) as session:
-        async def fetch_account(username: str) -> tuple[str, list[Tweet]]:
+        async def fetch_account(username: str) -> tuple[str, list[Tweet], str | None]:
             logger.info("Checking @%s...", username)
-            tweets = await fetch_tweets(session, username, config, cursors.get(username))
-            return username, tweets
+            tweets, newest_id = await fetch_tweets(session, username, config, cursors.get(username))
+            return username, tweets, newest_id
 
         results = await asyncio.gather(
             *[fetch_account(username) for username in config["accounts"]]
         )
-        for username, tweets in results:
+        for username, tweets, newest_id in results:
             pending = [tweet for tweet in tweets if tweet.id not in sent]
-            if username not in cursors and tweets:
-                for tweet in tweets:
-                    sent.add(tweet.id)
-                    _update_cursor(cursors, username, tweet.id)
-                save_sent(sent)
-                save_cursors(cursors)
-                logger.info(
-                    "Bootstrap @%s: marked %s existing tweets as seen",
-                    username,
-                    len(tweets),
-                )
-                pending = []
+            if username not in cursors:
+                if tweets:
+                    for tweet in tweets:
+                        sent.add(tweet.id)
+                    _update_cursor(
+                        cursors,
+                        username,
+                        max(tweets, key=lambda tweet: int(tweet.id)).id,
+                    )
+                elif newest_id:
+                    _update_cursor(cursors, username, newest_id)
+                if username in cursors:
+                    save_sent(sent)
+                    save_cursors(cursors)
+                    logger.info(
+                        "Bootstrap @%s: skipped %s existing tweets (posts/reposts/replies)",
+                        username,
+                        len(tweets),
+                    )
+                    pending = []
             pending_by_account[username] = pending
 
         if config["bootstrap"] and not sent:
