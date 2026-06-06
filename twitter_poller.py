@@ -92,8 +92,9 @@ def load_config() -> dict:
         "target_thread_id": target_thread_id,
         "accounts": [account.strip().lstrip("@") for account in config.get("accounts", []) if account],
         "check_interval": max(15, int(config.get("check_interval", 30))),
-        "exclude_retweets": bool(config.get("exclude_retweets", False)),
-        "exclude_replies": bool(config.get("exclude_replies", False)),
+        "exclude_retweets": bool(config.get("exclude_retweets", True)),
+        "exclude_replies": bool(config.get("exclude_replies", True)),
+        "exclude_quotes": bool(config.get("exclude_quotes", True)),
         "max_per_check": max(5, int(config.get("max_tweets_per_check", 5))),
         "bootstrap": bool(config.get("bootstrap", True)),
         "keywords_filter": [item.lower() for item in config.get("keywords_filter", []) if item],
@@ -538,6 +539,8 @@ def _should_skip_tweet(tweet: Tweet, config: dict) -> bool:
         return True
     if config["exclude_replies"] and tweet.kind == "reply":
         return True
+    if config.get("exclude_quotes") and tweet.kind == "quote":
+        return True
     if config["keywords_filter"]:
         lowered = tweet.text.lower()
         if not any(keyword in lowered for keyword in config["keywords_filter"]):
@@ -786,9 +789,20 @@ async def check_twitter_accounts(
             *[fetch_account(username) for username in config["accounts"]]
         )
         for username, tweets in results:
-            pending_by_account[username] = [
-                tweet for tweet in tweets if tweet.id not in sent
-            ]
+            pending = [tweet for tweet in tweets if tweet.id not in sent]
+            if username not in cursors and tweets:
+                for tweet in tweets:
+                    sent.add(tweet.id)
+                    _update_cursor(cursors, username, tweet.id)
+                save_sent(sent)
+                save_cursors(cursors)
+                logger.info(
+                    "Bootstrap @%s: marked %s existing tweets as seen",
+                    username,
+                    len(tweets),
+                )
+                pending = []
+            pending_by_account[username] = pending
 
         if config["bootstrap"] and not sent:
             bootstrapped = sum(len(items) for items in pending_by_account.values())

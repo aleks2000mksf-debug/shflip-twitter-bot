@@ -44,6 +44,19 @@ async def translate_to_russian(text: str, proxy_url: str | None) -> str:
 POST_FOOTER = (
     '<a href="https://t.me/pay2pass_bot?start=shflips_community">shflips community</a>'
 )
+CAPTION_LIMIT = 1024
+
+
+def format_action_link(tweet: Tweet) -> str:
+    label = html.escape(tweet_button_text(tweet))
+    link = html.escape(tweet.link, quote=True)
+    return f'<a href="{link}">{label} →</a>'
+
+
+def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _x_user_link(username: str) -> str:
@@ -148,10 +161,11 @@ async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
         body = clean_tweet_text(body)
     body = await translate_to_russian(body, proxy_url)
     body = clean_tweet_text(body)
+    action_link = format_action_link(tweet)
     if body:
         quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
-        return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
-    return f"{header}\n\n{POST_FOOTER}"
+        return f"{header}\n\n{quoted}\n\n{action_link}\n\n{POST_FOOTER}"
+    return f"{header}\n\n{action_link}\n\n{POST_FOOTER}"
 
 
 def create_bot(token: str, proxy_url: str | None) -> Bot:
@@ -209,6 +223,30 @@ async def _media_input(
         return media_item.url
 
 
+async def _send_with_markup(
+    bot: Bot,
+    send_callable,
+    *,
+    chat_id: str,
+    thread_id: int | None,
+    markup: InlineKeyboardMarkup,
+    tweet: Tweet,
+    fallback_text: str,
+) -> None:
+    try:
+        await send_callable(reply_markup=markup)
+    except Exception:
+        logger.warning("Retrying send without inline button markup")
+        await send_callable(reply_markup=None)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=format_action_link(tweet),
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            **_thread_kwargs(thread_id),
+        )
+
+
 async def _send_video(
     bot: Bot,
     chat_id: str,
@@ -217,31 +255,44 @@ async def _send_video(
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
     thread_id: int | None,
+    tweet: Tweet,
 ) -> None:
     video = await _media_input(video_item, proxy_url, allow_download=True)
-    try:
-        await bot.send_video(
-            chat_id=chat_id,
-            video=video,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            **_thread_kwargs(thread_id),
-        )
-        return
-    except Exception:
-        if video == video_item.url:
-            raise
-        logger.warning("Retrying video upload after direct URL failed")
-        downloaded = await _media_input(video_item, proxy_url, allow_download=True)
-        await bot.send_video(
-            chat_id=chat_id,
-            video=downloaded,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            **_thread_kwargs(thread_id),
-        )
+    caption = trim_caption(text)
+
+    async def send_video(reply_markup=None):
+        media = video
+        try:
+            await bot.send_video(
+                chat_id=chat_id,
+                video=media,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                **_thread_kwargs(thread_id),
+            )
+        except Exception:
+            if media == video_item.url:
+                raise
+            media = await _media_input(video_item, proxy_url, allow_download=True)
+            await bot.send_video(
+                chat_id=chat_id,
+                video=media,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                **_thread_kwargs(thread_id),
+            )
+
+    await _send_with_markup(
+        bot,
+        send_video,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        markup=markup,
+        tweet=tweet,
+        fallback_text=text,
+    )
 
 
 async def _send_photo(
@@ -252,31 +303,43 @@ async def _send_photo(
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
     thread_id: int | None,
+    tweet: Tweet,
 ) -> None:
-    photo = await _media_input(photo_item, proxy_url, allow_download=False)
-    try:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=photo,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            **_thread_kwargs(thread_id),
-        )
-        return
-    except Exception:
-        if photo != photo_item.url:
-            raise
-        logger.warning("Retrying photo upload after direct URL failed")
-        downloaded = await _media_input(photo_item, proxy_url, allow_download=True)
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=downloaded,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            **_thread_kwargs(thread_id),
-        )
+    caption = trim_caption(text)
+
+    async def send_photo(reply_markup=None):
+        photo = await _media_input(photo_item, proxy_url, allow_download=False)
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                **_thread_kwargs(thread_id),
+            )
+        except Exception:
+            if photo != photo_item.url:
+                raise
+            downloaded = await _media_input(photo_item, proxy_url, allow_download=True)
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=downloaded,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                **_thread_kwargs(thread_id),
+            )
+
+    await _send_with_markup(
+        bot,
+        send_photo,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        markup=markup,
+        tweet=tweet,
+        fallback_text=text,
+    )
 
 
 async def _send_photo_album(
@@ -287,7 +350,9 @@ async def _send_photo_album(
     markup: InlineKeyboardMarkup,
     proxy_url: str | None,
     thread_id: int | None,
+    tweet: Tweet,
 ) -> None:
+    caption = trim_caption(text)
     media_group: list[InputMediaPhoto] = []
     for index, photo_item in enumerate(photos):
         photo = await _media_input(photo_item, proxy_url, allow_download=False)
@@ -295,7 +360,7 @@ async def _send_photo_album(
             media_group.append(
                 InputMediaPhoto(
                     media=photo,
-                    caption=text,
+                    caption=caption,
                     parse_mode=ParseMode.HTML,
                 )
             )
@@ -317,7 +382,7 @@ async def _send_photo_album(
                 media_group.append(
                     InputMediaPhoto(
                         media=photo,
-                        caption=text,
+                        caption=caption,
                         parse_mode=ParseMode.HTML,
                     )
                 )
@@ -331,7 +396,8 @@ async def _send_photo_album(
 
     await bot.send_message(
         chat_id=chat_id,
-        text="\u200b",
+        text=format_action_link(tweet),
+        parse_mode=ParseMode.HTML,
         reply_markup=markup,
         **_thread_kwargs(thread_id),
     )
@@ -350,19 +416,30 @@ async def send_tweet(
     videos = [item for item in tweet.media if item.kind == "video"]
 
     if videos:
-        await _send_video(bot, chat_id, videos[0], text, markup, proxy_url, thread_id)
+        await _send_video(bot, chat_id, videos[0], text, markup, proxy_url, thread_id, tweet)
     elif len(photos) == 1:
-        await _send_photo(bot, chat_id, photos[0], text, markup, proxy_url, thread_id)
+        await _send_photo(bot, chat_id, photos[0], text, markup, proxy_url, thread_id, tweet)
     elif len(photos) > 1:
-        await _send_photo_album(bot, chat_id, photos, text, markup, proxy_url, thread_id)
+        await _send_photo_album(bot, chat_id, photos, text, markup, proxy_url, thread_id, tweet)
     else:
-        await bot.send_message(
+        async def send_message(reply_markup=None):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+                **_thread_kwargs(thread_id),
+            )
+
+        await _send_with_markup(
+            bot,
+            send_message,
             chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=markup,
-            **_thread_kwargs(thread_id),
+            thread_id=thread_id,
+            markup=markup,
+            tweet=tweet,
+            fallback_text=text,
         )
 
 
