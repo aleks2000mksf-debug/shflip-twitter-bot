@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SENT_FILE = Path(__file__).parent / "sent_tweets.json"
+CURSORS_FILE = Path(__file__).parent / "account_cursors.json"
+
+_user_id_cache: dict[str, str] = {}
 
 HEADERS = {
     "User-Agent": (
@@ -33,7 +37,6 @@ DEFAULT_NITTER_INSTANCES = [
 
 TWEET_ID_RE = re.compile(r"/status/(\d+)")
 IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
-RT_PREFIX_RE = re.compile(r"^RT\s+@", re.IGNORECASE)
 RT_FULL_RE = re.compile(r"^RT\s+@(\w+):\s*(.+)$", re.IGNORECASE | re.DOTALL)
 REPLY_TARGET_RE = re.compile(r"^@(\w+)")
 
@@ -65,10 +68,10 @@ def load_config() -> dict:
         "bot_token": config.get("bot_token") or os.getenv("BOT_TOKEN", ""),
         "target_chat_id": str(config.get("target_chat_id") or os.getenv("TARGET_CHAT_ID", "")),
         "accounts": [account.strip().lstrip("@") for account in config.get("accounts", []) if account],
-        "check_interval": int(config.get("check_interval", 300)),
+        "check_interval": max(15, int(config.get("check_interval", 30))),
         "exclude_retweets": bool(config.get("exclude_retweets", False)),
         "exclude_replies": bool(config.get("exclude_replies", False)),
-        "max_per_check": int(config.get("max_tweets_per_check", 5)),
+        "max_per_check": int(config.get("max_tweets_per_check", 3)),
         "bootstrap": bool(config.get("bootstrap", True)),
         "keywords_filter": [item.lower() for item in config.get("keywords_filter", []) if item],
         "instances": [item.rstrip("/") for item in instances],
@@ -92,6 +95,31 @@ def load_sent() -> set[str]:
 def save_sent(sent: set[str]) -> None:
     items = sorted(sent)[-10000:]
     SENT_FILE.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+
+def load_cursors() -> dict[str, str]:
+    if not CURSORS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CURSORS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read account_cursors.json: %s", exc)
+    return {}
+
+
+def save_cursors(cursors: dict[str, str]) -> None:
+    CURSORS_FILE.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
+
+
+def _update_cursor(cursors: dict[str, str], username: str, tweets: list[Tweet]) -> None:
+    if not tweets:
+        return
+    newest = max(tweets, key=lambda tweet: int(tweet.id)).id
+    previous = cursors.get(username)
+    if not previous or int(newest) > int(previous):
+        cursors[username] = newest
 
 
 def _strip_html(html_text: str) -> str:
@@ -306,19 +334,28 @@ async def _get_x_user_id(
     username: str,
     bearer_token: str,
 ) -> str | None:
+    cached = _user_id_cache.get(username.lower())
+    if cached:
+        return cached
+
     url = f"https://api.twitter.com/2/users/by/username/{username}"
     headers = {"Authorization": f"Bearer {bearer_token}"}
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
         if response.status != 200:
             return None
         payload = await response.json()
-    return payload.get("data", {}).get("id")
+
+    user_id = payload.get("data", {}).get("id")
+    if user_id:
+        _user_id_cache[username.lower()] = user_id
+    return user_id
 
 
 async def fetch_tweets_x_api(
     session: aiohttp.ClientSession,
     username: str,
     config: dict,
+    since_id: str | None = None,
 ) -> list[Tweet]:
     bearer_token = config["x_bearer_token"]
     if not bearer_token:
@@ -335,9 +372,11 @@ async def fetch_tweets_x_api(
         "&expansions=referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id"
         "&user.fields=username"
     )
+    if since_id:
+        url += f"&since_id={since_id}"
     headers = {"Authorization": f"Bearer {bearer_token}"}
 
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
         if response.status != 200:
             body = await response.text()
             logger.warning("X API error for @%s: %s %s", username, response.status, body[:200])
@@ -357,9 +396,10 @@ async def fetch_tweets(
     session: aiohttp.ClientSession,
     username: str,
     config: dict,
+    since_id: str | None = None,
 ) -> list[Tweet]:
     if config["x_bearer_token"]:
-        tweets = await fetch_tweets_x_api(session, username, config)
+        tweets = await fetch_tweets_x_api(session, username, config, since_id)
         if tweets:
             return tweets
     return await fetch_tweets_nitter(session, username, config)
@@ -373,16 +413,26 @@ async def check_twitter_accounts(
         return 0
 
     sent = load_sent()
+    cursors = load_cursors()
     new_count = 0
     pending_by_account: dict[str, list[Tweet]] = {}
 
     async with await _create_session(config["proxy_url"]) as session:
-        for username in config["accounts"]:
+        async def fetch_account(username: str) -> tuple[str, list[Tweet]]:
             logger.info("Checking @%s...", username)
-            tweets = await fetch_tweets(session, username, config)
+            tweets = await fetch_tweets(session, username, config, cursors.get(username))
+            _update_cursor(cursors, username, tweets)
+            return username, tweets
+
+        results = await asyncio.gather(
+            *[fetch_account(username) for username in config["accounts"]]
+        )
+        for username, tweets in results:
             pending_by_account[username] = [
                 tweet for tweet in tweets if tweet.id not in sent
             ]
+
+        save_cursors(cursors)
 
         if config["bootstrap"] and not sent:
             bootstrapped = sum(len(items) for items in pending_by_account.values())

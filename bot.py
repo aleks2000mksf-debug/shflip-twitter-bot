@@ -14,7 +14,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+CYRILLIC_RE = re.compile(r"[а-яА-ЯёЁ]")
+
+
+def _needs_translation(text: str) -> bool:
+    cyrillic = len(CYRILLIC_RE.findall(text))
+    latin = len(re.findall(r"[a-zA-Z]", text))
+    total = cyrillic + latin
+    if total == 0:
+        return False
+    return cyrillic / total < 0.3
+
+
 async def translate_to_russian(text: str, proxy_url: str | None) -> str:
+    if not _needs_translation(text):
+        return text
     def _translate() -> str:
         from deep_translator import GoogleTranslator
 
@@ -149,7 +163,6 @@ async def run_check(bot: Bot, config: dict) -> int:
 
     async def on_new_tweet(tweet: Tweet) -> None:
         await send_tweet(bot, chat_id, tweet, config["proxy_url"])
-        await asyncio.sleep(1)
 
     return await check_twitter_accounts(config, on_new_tweet=on_new_tweet)
 

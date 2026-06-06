@@ -1,5 +1,6 @@
 config.json
 sent_tweets.json
+account_cursors.json
 __pycache__/
 *.pyc
 .venv/

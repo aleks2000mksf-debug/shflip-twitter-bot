@@ -1,7 +1,7 @@
 {
   "bot_token": "your_bot_token_here",
   "target_chat_id": "-1001234567890",
-  "check_interval": 300,
+  "check_interval": 30,
   "accounts": [
     "elonmusk",
     "shflips"
@@ -9,7 +9,7 @@
   "keywords_filter": [],
   "exclude_retweets": false,
   "exclude_replies": false,
-  "max_tweets_per_check": 5,
+  "max_tweets_per_check": 3,
   "bootstrap": true,
   "proxy_url": "",
   "nitter_url": "",
