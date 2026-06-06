@@ -40,7 +40,9 @@ IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 VIDEO_SOURCE_RE = re.compile(r'<source[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 VIDEO_TAG_RE = re.compile(r"<video[\s\S]*?</video>", re.IGNORECASE)
 RT_FULL_RE = re.compile(r"^RT\s+@(\w+):\s*(.+)$", re.IGNORECASE | re.DOTALL)
+RT_PREFIX_RE = re.compile(r"^RT\s+@(\w+)", re.IGNORECASE)
 REPLY_TARGET_RE = re.compile(r"^@(\w+)")
+TCO_URL_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
 SKIP_IMAGE_HINTS = ("profile_images", "emoji", "abs.twimg.com/emoji", "twemoji")
 
 
@@ -296,6 +298,126 @@ def _extract_media_from_html(description: str) -> list[MediaItem]:
     return items
 
 
+def _users_by_id(payload: dict) -> dict[str, str]:
+    return {
+        str(user["id"]): user.get("username", "")
+        for user in payload.get("includes", {}).get("users", [])
+        if user.get("id") is not None
+    }
+
+
+def _username_for_author(author_id: str | int | None, users: dict[str, str]) -> str | None:
+    if author_id is None:
+        return None
+    return users.get(str(author_id)) or None
+
+
+def _referenced_ids(item: dict) -> dict[str, str | None]:
+    retweeted_id = None
+    quoted_id = None
+    replied_id = None
+    for ref in item.get("referenced_tweets") or []:
+        ref_id = str(ref.get("id", "")).strip()
+        if not ref_id:
+            continue
+        ref_type = ref.get("type")
+        if ref_type == "retweeted":
+            retweeted_id = ref_id
+        elif ref_type == "quoted":
+            quoted_id = ref_id
+        elif ref_type == "replied_to":
+            replied_id = ref_id
+    return {
+        "retweeted": retweeted_id,
+        "quoted": quoted_id,
+        "replied": replied_id,
+    }
+
+
+def _apply_tweet_kind(
+    item: dict,
+    payload: dict,
+    username: str,
+) -> tuple[str, str | None, str, dict]:
+    users = _users_by_id(payload)
+    included = _included_tweets(payload)
+    item_text = (item.get("text") or "").strip()
+    refs = _referenced_ids(item)
+
+    kind = "post"
+    related_username: str | None = None
+    source_item: dict = item
+    text = item_text
+
+    if refs["retweeted"]:
+        kind = "retweet"
+        original = included.get(refs["retweeted"], {})
+        source_item = original or item
+        text = (original.get("text") or item_text).strip()
+        related_username = _username_for_author(original.get("author_id"), users)
+        if not related_username:
+            rt_match = RT_FULL_RE.match(item_text) or RT_PREFIX_RE.match(item_text)
+            if rt_match:
+                related_username = rt_match.group(1)
+    elif refs["quoted"]:
+        kind = "quote"
+        quoted = included.get(refs["quoted"], {})
+        source_item = quoted or item
+        related_username = _username_for_author(quoted.get("author_id"), users)
+        quoted_text = (quoted.get("text") or "").strip()
+        comment = TCO_URL_RE.sub("", item_text).strip()
+        if comment and quoted_text and comment != quoted_text:
+            text = f"{comment}\n\n—\n\n{quoted_text}"
+        else:
+            text = quoted_text or comment or item_text
+    elif refs["replied"]:
+        kind = "reply"
+        related_username = _username_for_author(item.get("in_reply_to_user_id"), users)
+        if not related_username:
+            reply_match = REPLY_TARGET_RE.match(text)
+            if reply_match:
+                related_username = reply_match.group(1)
+
+    if kind == "post":
+        parsed_kind, parsed_related, parsed_text = _classify_text(text)
+        if parsed_kind != "post":
+            kind = parsed_kind
+            text = parsed_text
+            related_username = parsed_related or related_username
+
+    if kind == "post" and RT_FULL_RE.match(item_text):
+        kind = "retweet"
+        rt_match = RT_FULL_RE.match(item_text)
+        related_username = rt_match.group(1)
+        text = rt_match.group(2).strip() or text
+    elif kind == "post" and RT_PREFIX_RE.match(item_text):
+        kind = "retweet"
+        related_username = RT_PREFIX_RE.match(item_text).group(1)
+
+    if (
+        kind == "post"
+        and related_username
+        and related_username.lower() != username.lower()
+    ):
+        kind = "quote"
+
+    return kind, related_username, text, source_item
+
+
+def _apply_attribution_from_item(item: dict, payload: dict, tweet: Tweet, username: str) -> None:
+    kind, related_username, text, source_item = _apply_tweet_kind(item, payload, username)
+    tweet.kind = kind
+    tweet.related_username = related_username
+    if text:
+        tweet.text = text
+    if kind in {"retweet", "quote"} and source_item:
+        media = _collect_media_items(source_item, payload, kind, source_item)
+        if not media:
+            media = _collect_media_items(item, payload, kind, source_item)
+        if media:
+            tweet.media = media
+
+
 def _classify_text(body: str) -> tuple[str, str | None, str]:
     stripped = body.strip()
     rt_match = RT_FULL_RE.match(stripped)
@@ -314,47 +436,10 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
     if not tweet_id:
         return None
 
-    users = {user["id"]: user.get("username", "") for user in payload.get("includes", {}).get("users", [])}
-    included_tweets = _included_tweets(payload)
-
-    kind = "post"
-    related_username: str | None = None
-    item_text = (item.get("text") or "").strip()
-    text = item_text
-    rt_match = RT_FULL_RE.match(item_text)
-    source_item: dict | None = item
-
-    for ref in item.get("referenced_tweets", []):
-        ref_type = ref.get("type")
-        ref_id = str(ref.get("id", "")).strip()
-        if ref_type == "retweeted" and ref_id:
-            kind = "retweet"
-            original = included_tweets.get(ref_id, {})
-            source_item = original or item
-            text = (original.get("text") or item_text).strip()
-            author_id = original.get("author_id")
-            if author_id:
-                related_username = users.get(author_id) or related_username
-            if not related_username and rt_match:
-                related_username = rt_match.group(1)
-            break
-        if ref_type == "replied_to":
-            kind = "reply"
-
-    in_reply_to = item.get("in_reply_to_user_id")
-    if in_reply_to and kind != "retweet":
-        kind = "reply"
-        related_username = users.get(in_reply_to) or related_username
-
-    if kind == "post":
-        parsed_kind, parsed_related, parsed_text = _classify_text(text)
-        if parsed_kind != "post":
-            kind = parsed_kind
-            text = parsed_text
-            related_username = parsed_related or related_username
+    kind, related_username, text, source_item = _apply_tweet_kind(item, payload, username)
 
     if not text:
-        text = _media_label(source_item or {}, payload) or _media_label(item, payload) or ""
+        text = _media_label(source_item, payload) or _media_label(item, payload) or ""
 
     media = _collect_media_items(item, payload, kind, source_item)
 
@@ -416,6 +501,17 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
             continue
 
         kind, related_username, text = _classify_text(body)
+        stripped = body.strip()
+        if kind == "post" and RT_PREFIX_RE.match(stripped):
+            kind = "retweet"
+            full_rt = RT_FULL_RE.match(stripped)
+            if full_rt:
+                related_username = full_rt.group(1)
+                text = full_rt.group(2).strip() or text
+            else:
+                prefix_rt = RT_PREFIX_RE.match(stripped)
+                if prefix_rt:
+                    related_username = prefix_rt.group(1)
         media = _extract_media_from_html(description) if description else []
         if not text and not media:
             continue
@@ -522,9 +618,10 @@ async def _fetch_tweet_by_id(
 ) -> tuple[dict | None, dict]:
     url = (
         f"https://api.twitter.com/2/tweets/{tweet_id}"
-        "?tweet.fields=attachments,entities,referenced_tweets,text"
-        "&expansions=attachments.media_keys"
+        "?tweet.fields=attachments,author_id,entities,referenced_tweets,text,in_reply_to_user_id"
+        "&expansions=attachments.media_keys,author_id,referenced_tweets.id,referenced_tweets.id.author_id"
         "&media.fields=preview_image_url,type,url,variants"
+        "&user.fields=username"
     )
     headers = {"Authorization": f"Bearer {bearer_token}"}
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -535,6 +632,40 @@ async def _fetch_tweet_by_id(
     if not isinstance(data, dict):
         return None, payload
     return data, payload
+
+
+async def _ensure_tweet_attribution(
+    session: aiohttp.ClientSession,
+    item: dict,
+    tweet: Tweet,
+    username: str,
+    bearer_token: str,
+) -> None:
+    if tweet.kind in {"retweet", "quote"} and tweet.related_username:
+        return
+
+    refs = _referenced_ids(item)
+    needs_lookup = tweet.kind == "post" or (
+        tweet.kind in {"retweet", "quote"} and not tweet.related_username
+    )
+    if not needs_lookup and not any(refs.values()):
+        return
+
+    details, details_payload = await _fetch_tweet_by_id(session, tweet.id, bearer_token)
+    if not details:
+        if refs["retweeted"]:
+            details, details_payload = await _fetch_tweet_by_id(
+                session, refs["retweeted"], bearer_token
+            )
+            if details:
+                author = _username_for_author(details.get("author_id"), _users_by_id(details_payload))
+                tweet.kind = "retweet"
+                tweet.related_username = author
+                if details.get("text"):
+                    tweet.text = details["text"]
+        return
+
+    _apply_attribution_from_item(details, details_payload, tweet, username)
 
 
 async def _ensure_tweet_media(
@@ -614,6 +745,7 @@ async def fetch_tweets_x_api(
             raw_items.append(item)
 
     for item, tweet in zip(raw_items, tweets):
+        await _ensure_tweet_attribution(session, item, tweet, username, bearer_token)
         await _ensure_tweet_media(session, item, tweet, bearer_token)
 
     return tweets

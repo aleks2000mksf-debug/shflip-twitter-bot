@@ -64,6 +64,17 @@ def format_header(tweet: Tweet) -> str:
             f"🔁 <b>Репост</b>\n"
             f"<i>от {author_link}</i>"
         )
+    if tweet.kind == "quote":
+        if tweet.related_username:
+            target_link = _x_user_link(tweet.related_username)
+            return (
+                f"💬 <b>Цитата · {target_link}</b>\n"
+                f"<i>от {author_link}</i>"
+            )
+        return (
+            f"💬 <b>Цитата</b>\n"
+            f"<i>от {author_link}</i>"
+        )
     if tweet.kind == "reply" and tweet.related_username:
         target_link = _x_user_link(tweet.related_username)
         return (
@@ -76,6 +87,8 @@ def format_header(tweet: Tweet) -> str:
 def tweet_button_text(tweet: Tweet) -> str:
     if tweet.kind == "retweet":
         return "Открыть репост в X"
+    if tweet.kind == "quote":
+        return "Открыть цитату в X"
     if tweet.kind == "reply":
         return "Открыть ответ в X"
     return "Открыть пост в X"
