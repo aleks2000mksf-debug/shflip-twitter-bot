@@ -5,7 +5,7 @@ import re
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import BufferedInputFile, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 import aiohttp
 
@@ -56,7 +56,36 @@ def format_action_link(tweet: Tweet) -> str:
 def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     if len(text) <= limit:
         return text
-    return text[: limit - 1].rstrip() + "…"
+
+    cut = text[: limit - 1].rstrip()
+    cut = re.sub(r"<[^>]*$", "", cut)
+    cut = re.sub(r"<blockquote>\s*$", "", cut)
+    cut = re.sub(r"<b>\s*$", "", cut)
+
+    open_tags = re.findall(r"<(blockquote|b|i|a)\b", cut, flags=re.IGNORECASE)
+    close_tags = re.findall(r"</(blockquote|b|i|a)>", cut, flags=re.IGNORECASE)
+    for tag in reversed(open_tags[len(close_tags) :]):
+        if tag.lower() == "a":
+            cut += "</a>"
+        elif tag.lower() == "blockquote":
+            cut += "</blockquote>"
+        elif tag.lower() == "b":
+            cut += "</b>"
+        elif tag.lower() == "i":
+            cut += "</i>"
+
+    if len(cut) > limit:
+        cut = cut[: limit - 1].rstrip()
+        cut = re.sub(r"<[^>]*$", "", cut)
+
+    return cut + "…"
+
+
+def _assemble_tweet_text(header: str, body: str, action_link: str) -> str:
+    if body:
+        quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
+        return f"{header}\n\n{quoted}\n\n{action_link}\n\n{POST_FOOTER}"
+    return f"{header}\n\n{action_link}\n\n{POST_FOOTER}"
 
 
 def _x_user_link(username: str) -> str:
@@ -153,7 +182,11 @@ def clean_tweet_text(text: str) -> str:
     return _tidy_text(cleaned)
 
 
-async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
+async def format_tweet(
+    tweet: Tweet,
+    proxy_url: str | None,
+    caption_limit: int | None = None,
+) -> str:
     header = format_header(tweet)
     body = clean_tweet_text(tweet.text)
     if tweet.media:
@@ -162,10 +195,19 @@ async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     body = await translate_to_russian(body, proxy_url)
     body = clean_tweet_text(body)
     action_link = format_action_link(tweet)
-    if body:
-        quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
-        return f"{header}\n\n{quoted}\n\n{action_link}\n\n{POST_FOOTER}"
-    return f"{header}\n\n{action_link}\n\n{POST_FOOTER}"
+
+    if caption_limit and body:
+        trimmed = body
+        while trimmed and len(_assemble_tweet_text(header, trimmed, action_link)) > caption_limit:
+            trimmed = trimmed[: max(0, len(trimmed) - 80)].rstrip()
+        if len(trimmed) < len(body):
+            trimmed = (trimmed + "…") if trimmed else trimmed
+        body = trimmed
+
+    text = _assemble_tweet_text(header, body, action_link)
+    if caption_limit:
+        text = trim_caption(text, caption_limit)
+    return text
 
 
 def create_bot(token: str, proxy_url: str | None) -> Bot:
@@ -258,7 +300,7 @@ async def _send_video(
     tweet: Tweet,
 ) -> None:
     video = await _media_input(video_item, proxy_url, allow_download=True)
-    caption = trim_caption(text)
+    caption = text
 
     async def send_video(reply_markup=None):
         media = video
@@ -305,7 +347,7 @@ async def _send_photo(
     thread_id: int | None,
     tweet: Tweet,
 ) -> None:
-    caption = trim_caption(text)
+    caption = text
 
     async def send_photo(reply_markup=None):
         photo = await _media_input(photo_item, proxy_url, allow_download=False)
@@ -352,7 +394,7 @@ async def _send_photo_album(
     thread_id: int | None,
     tweet: Tweet,
 ) -> None:
-    caption = trim_caption(text)
+    caption = text
     media_group: list[InputMediaPhoto] = []
     for index, photo_item in enumerate(photos):
         photo = await _media_input(photo_item, proxy_url, allow_download=False)
@@ -373,6 +415,26 @@ async def _send_photo_album(
             media=media_group,
             **_thread_kwargs(thread_id),
         )
+    except TelegramBadRequest:
+        logger.warning("Photo album caption rejected, retrying without caption")
+        media_group = []
+        for photo_item in photos:
+            photo = await _media_input(photo_item, proxy_url, allow_download=True)
+            media_group.append(InputMediaPhoto(media=photo))
+        await bot.send_media_group(
+            chat_id=chat_id,
+            media=media_group,
+            **_thread_kwargs(thread_id),
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=markup,
+            **_thread_kwargs(thread_id),
+        )
+        return
     except Exception:
         logger.warning("Retrying photo album with downloaded files")
         media_group = []
@@ -410,10 +472,15 @@ async def send_tweet(
     proxy_url: str | None,
     thread_id: int | None = None,
 ) -> None:
-    text = await format_tweet(tweet, proxy_url)
-    markup = build_reply_markup(tweet)
     photos = [item for item in tweet.media if item.kind == "photo"]
     videos = [item for item in tweet.media if item.kind == "video"]
+    has_media = bool(videos or photos)
+    text = await format_tweet(
+        tweet,
+        proxy_url,
+        caption_limit=CAPTION_LIMIT if has_media else None,
+    )
+    markup = build_reply_markup(tweet)
 
     if videos:
         await _send_video(bot, chat_id, videos[0], text, markup, proxy_url, thread_id, tweet)
