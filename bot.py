@@ -31,12 +31,31 @@ POST_FOOTER = (
 )
 
 
+def format_header(tweet: Tweet) -> str:
+    author = html.escape(tweet.username)
+    if tweet.kind == "retweet" and tweet.related_username:
+        target = html.escape(tweet.related_username)
+        return (
+            f"🔁 <b>Репост · @{target}</b>\n"
+            f"<i>от @{author}</i>"
+        )
+    if tweet.kind == "reply" and tweet.related_username:
+        target = html.escape(tweet.related_username)
+        return (
+            f"↩️ <b>Ответ · @{target}</b>\n"
+            f"<i>от @{author}</i>"
+        )
+    return f"📝 <b>@{author}</b>"
+
+
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
+    header = format_header(tweet)
     body = await translate_to_russian(tweet.text, proxy_url)
     quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
     return (
+        f"{header}\n\n"
         f"{quoted}\n\n"
-        f'<a href="{html.escape(tweet.link)}">Открыть в X · @{html.escape(tweet.username)}</a>\n\n'
+        f'<a href="{html.escape(tweet.link)}">Открыть в X</a>\n\n'
         f"{POST_FOOTER}"
     )
 

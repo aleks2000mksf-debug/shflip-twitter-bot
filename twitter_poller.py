@@ -34,6 +34,8 @@ DEFAULT_NITTER_INSTANCES = [
 TWEET_ID_RE = re.compile(r"/status/(\d+)")
 IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 RT_PREFIX_RE = re.compile(r"^RT\s+@", re.IGNORECASE)
+RT_FULL_RE = re.compile(r"^RT\s+@(\w+):\s*(.+)$", re.IGNORECASE | re.DOTALL)
+REPLY_TARGET_RE = re.compile(r"^@(\w+)")
 
 
 @dataclass
@@ -43,6 +45,8 @@ class Tweet:
     text: str
     link: str
     image_url: str | None = None
+    kind: str = "post"
+    related_username: str | None = None
 
 
 def load_config() -> dict:
@@ -109,6 +113,79 @@ def _extract_image_url(description: str) -> str | None:
     return url
 
 
+def _classify_text(body: str) -> tuple[str, str | None, str]:
+    stripped = body.strip()
+    rt_match = RT_FULL_RE.match(stripped)
+    if rt_match:
+        return "retweet", rt_match.group(1), rt_match.group(2).strip()
+
+    reply_match = REPLY_TARGET_RE.match(stripped)
+    if reply_match:
+        return "reply", reply_match.group(1), stripped
+
+    return "post", None, stripped
+
+
+def _extract_image_from_entities(item: dict) -> str | None:
+    for media in item.get("entities", {}).get("urls", []):
+        expanded = media.get("expanded_url", "")
+        if "pic.twitter.com" in expanded or "pic.x.com" in expanded:
+            return expanded
+    return None
+
+
+def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
+    tweet_id = str(item.get("id", "")).strip()
+    if not tweet_id:
+        return None
+
+    users = {user["id"]: user.get("username", "") for user in payload.get("includes", {}).get("users", [])}
+    included_tweets = {
+        tweet["id"]: tweet for tweet in payload.get("includes", {}).get("tweets", [])
+    }
+
+    kind = "post"
+    related_username: str | None = None
+    text = (item.get("text") or "").strip()
+
+    for ref in item.get("referenced_tweets", []):
+        ref_type = ref.get("type")
+        ref_id = ref.get("id")
+        if ref_type == "retweeted" and ref_id:
+            kind = "retweet"
+            original = included_tweets.get(ref_id, {})
+            text = (original.get("text") or text).strip()
+            author_id = original.get("author_id")
+            if author_id:
+                related_username = users.get(author_id) or related_username
+            break
+        if ref_type == "replied_to":
+            kind = "reply"
+
+    in_reply_to = item.get("in_reply_to_user_id")
+    if in_reply_to and kind != "retweet":
+        kind = "reply"
+        related_username = users.get(in_reply_to) or related_username
+
+    if not text:
+        return None
+
+    if kind == "post":
+        kind, parsed_related, text = _classify_text(text)
+        if parsed_related:
+            related_username = parsed_related
+
+    return Tweet(
+        id=tweet_id,
+        username=username,
+        text=text,
+        link=f"https://twitter.com/{username}/status/{tweet_id}",
+        image_url=_extract_image_from_entities(item),
+        kind=kind,
+        related_username=related_username,
+    )
+
+
 def _extract_tweet_id(link: str, guid: str = "") -> str:
     for candidate in (link, guid):
         match = TWEET_ID_RE.search(candidate)
@@ -149,13 +226,19 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
         if not body:
             continue
 
+        kind, related_username, text = _classify_text(body)
+        if not text:
+            continue
+
         tweets.append(
             Tweet(
                 id=tweet_id,
                 username=username,
-                text=body,
+                text=text,
                 link=f"https://twitter.com/{username}/status/{tweet_id}",
                 image_url=_extract_image_url(description) if description else None,
+                kind=kind,
+                related_username=related_username,
             )
         )
 
@@ -163,13 +246,12 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
 
 
 def _should_skip_tweet(tweet: Tweet, config: dict) -> bool:
-    text = tweet.text.strip()
-    if config["exclude_retweets"] and RT_PREFIX_RE.match(text):
+    if config["exclude_retweets"] and tweet.kind == "retweet":
         return True
-    if config["exclude_replies"] and text.startswith("@"):
+    if config["exclude_replies"] and tweet.kind == "reply":
         return True
     if config["keywords_filter"]:
-        lowered = text.lower()
+        lowered = tweet.text.lower()
         if not any(keyword in lowered for keyword in config["keywords_filter"]):
             return True
     return False
@@ -249,38 +331,24 @@ async def fetch_tweets_x_api(
     url = (
         f"https://api.twitter.com/2/users/{user_id}/tweets"
         f"?max_results={min(config['max_per_check'], 10)}"
-        "&tweet.fields=created_at,entities"
+        "&tweet.fields=created_at,entities,referenced_tweets,author_id,in_reply_to_user_id,text"
+        "&expansions=referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id"
+        "&user.fields=username"
     )
     headers = {"Authorization": f"Bearer {bearer_token}"}
 
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
         if response.status != 200:
+            body = await response.text()
+            logger.warning("X API error for @%s: %s %s", username, response.status, body[:200])
             return []
         payload = await response.json()
 
     tweets: list[Tweet] = []
     for item in payload.get("data", []):
-        tweet_id = str(item.get("id", "")).strip()
-        text = (item.get("text") or "").strip()
-        if not tweet_id or not text:
-            continue
-
-        image_url = None
-        for media in item.get("entities", {}).get("urls", []):
-            expanded = media.get("expanded_url", "")
-            if "pic.twitter.com" in expanded or "pic.x.com" in expanded:
-                image_url = expanded
-                break
-
-        tweets.append(
-            Tweet(
-                id=tweet_id,
-                username=username,
-                text=text,
-                link=f"https://twitter.com/{username}/status/{tweet_id}",
-                image_url=image_url,
-            )
-        )
+        tweet = _parse_x_api_item(item, username, payload)
+        if tweet:
+            tweets.append(tweet)
 
     return tweets
 
