@@ -5,7 +5,10 @@
   "check_interval": 30,
   "accounts": [
     "elonmusk",
-    "shflips"
+    "durov",
+    "shflips",
+    "bitget",
+    "zachxbt"
   ],
   "keywords_filter": [],
   "exclude_retweets": false,
