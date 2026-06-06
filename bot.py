@@ -47,13 +47,11 @@ POST_FOOTER = (
 CAPTION_LIMIT = 1024
 
 
-def format_action_link(tweet: Tweet) -> str:
-    label = html.escape(tweet_button_text(tweet))
-    link = html.escape(tweet.link, quote=True)
-    return f'<a href="{link}">{label} →</a>'
-
-
-def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
+def _assemble_tweet_text(header: str, body: str) -> str:
+    if body:
+        quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
+        return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
+    return f"{header}\n\n{POST_FOOTER}"
     if len(text) <= limit:
         return text
 
@@ -81,14 +79,7 @@ def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     return cut + "…"
 
 
-def _assemble_tweet_text(header: str, body: str, action_link: str) -> str:
-    if body:
-        quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
-        return f"{header}\n\n{quoted}\n\n{action_link}\n\n{POST_FOOTER}"
-    return f"{header}\n\n{action_link}\n\n{POST_FOOTER}"
-
-
-def _x_user_link(username: str) -> str:
+def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     profile = f"https://twitter.com/{username}"
     return f'<a href="{html.escape(profile)}">@{html.escape(username)}</a>'
 
@@ -194,17 +185,16 @@ async def format_tweet(
         body = clean_tweet_text(body)
     body = await translate_to_russian(body, proxy_url)
     body = clean_tweet_text(body)
-    action_link = format_action_link(tweet)
 
     if caption_limit and body:
         trimmed = body
-        while trimmed and len(_assemble_tweet_text(header, trimmed, action_link)) > caption_limit:
+        while trimmed and len(_assemble_tweet_text(header, trimmed)) > caption_limit:
             trimmed = trimmed[: max(0, len(trimmed) - 80)].rstrip()
         if len(trimmed) < len(body):
             trimmed = (trimmed + "…") if trimmed else trimmed
         body = trimmed
 
-    text = _assemble_tweet_text(header, body, action_link)
+    text = _assemble_tweet_text(header, body)
     if caption_limit:
         text = trim_caption(text, caption_limit)
     return text
@@ -282,7 +272,7 @@ async def _send_with_markup(
         await send_callable(reply_markup=None)
         await bot.send_message(
             chat_id=chat_id,
-            text=format_action_link(tweet),
+            text=POST_FOOTER,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
             **_thread_kwargs(thread_id),
@@ -458,7 +448,7 @@ async def _send_photo_album(
 
     await bot.send_message(
         chat_id=chat_id,
-        text=format_action_link(tweet),
+        text=POST_FOOTER,
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
         **_thread_kwargs(thread_id),
