@@ -73,27 +73,41 @@ TWITTER_STATUS_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/(?:\w+|i/web)/status/\d+\S*",
     re.IGNORECASE,
 )
+TWITTER_PROFILE_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/@?\w+(?!/status)\S*",
+    re.IGNORECASE,
+)
 PIC_URL_RE = re.compile(
     r"(?:https?://)?(?:pic\.)?(?:twitter\.com|x\.com)/\S+",
     re.IGNORECASE,
 )
+TCO_URL_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
 
 
-def clean_tweet_text(text: str) -> str:
-    """Remove Twitter post/media links from body; keep other URLs from the original."""
-    cleaned = TWITTER_STATUS_URL_RE.sub("", text)
-    cleaned = PIC_URL_RE.sub("", cleaned)
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+def _tidy_text(text: str) -> str:
+    cleaned = re.sub(r"[ \t]+\n", "\n", text)
     cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
+    cleaned = re.sub(r" +\.", ".", cleaned)
+    cleaned = re.sub(r" +,", ",", cleaned)
     return cleaned.strip()
+
+
+def clean_tweet_text(text: str) -> str:
+    """Remove Twitter/X service links from quote body; keep normal external URLs."""
+    cleaned = TWITTER_STATUS_URL_RE.sub("", text)
+    cleaned = TWITTER_PROFILE_URL_RE.sub("", cleaned)
+    cleaned = PIC_URL_RE.sub("", cleaned)
+    cleaned = TCO_URL_RE.sub("", cleaned)
+    return _tidy_text(cleaned)
 
 
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     header = format_header(tweet)
     body = clean_tweet_text(tweet.text)
     body = await translate_to_russian(body, proxy_url)
+    body = clean_tweet_text(body)
     quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
     return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
 
