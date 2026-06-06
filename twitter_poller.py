@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import unescape
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -37,8 +37,17 @@ DEFAULT_NITTER_INSTANCES = [
 
 TWEET_ID_RE = re.compile(r"/status/(\d+)")
 IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+VIDEO_SOURCE_RE = re.compile(r'<source[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+VIDEO_TAG_RE = re.compile(r"<video[\s\S]*?</video>", re.IGNORECASE)
 RT_FULL_RE = re.compile(r"^RT\s+@(\w+):\s*(.+)$", re.IGNORECASE | re.DOTALL)
 REPLY_TARGET_RE = re.compile(r"^@(\w+)")
+SKIP_IMAGE_HINTS = ("profile_images", "emoji", "abs.twimg.com/emoji", "twemoji")
+
+
+@dataclass
+class MediaItem:
+    kind: str
+    url: str
 
 
 @dataclass
@@ -47,9 +56,16 @@ class Tweet:
     username: str
     text: str
     link: str
-    image_url: str | None = None
+    media: list[MediaItem] = field(default_factory=list)
     kind: str = "post"
     related_username: str | None = None
+
+    @property
+    def image_url(self) -> str | None:
+        for item in self.media:
+            if item.kind == "photo":
+                return item.url
+        return None
 
 
 def load_config() -> dict:
@@ -144,14 +160,79 @@ def _strip_html(html_text: str) -> str:
     return unescape(re.sub(r"\n{3,}", "\n\n", text)).strip()
 
 
-def _extract_image_url(description: str) -> str | None:
-    match = IMG_SRC_RE.search(description)
-    if not match:
-        return None
-    url = match.group(1).strip()
-    if url.startswith("//"):
-        return f"https:{url}"
-    return url
+def _best_video_url(media: dict) -> str | None:
+    variants = media.get("variants") or []
+    mp4_variants = [
+        variant
+        for variant in variants
+        if variant.get("content_type") == "video/mp4" and variant.get("url")
+    ]
+    if mp4_variants:
+        return max(mp4_variants, key=lambda variant: variant.get("bit_rate") or 0)["url"]
+    return None
+
+
+def _extract_media_items(item: dict, payload: dict) -> list[MediaItem]:
+    media_by_key = {
+        media["media_key"]: media
+        for media in payload.get("includes", {}).get("media", [])
+        if media.get("media_key")
+    }
+    items: list[MediaItem] = []
+    for media_key in item.get("attachments", {}).get("media_keys", []):
+        media = media_by_key.get(media_key, {})
+        media_type = media.get("type")
+        if media_type == "photo":
+            url = media.get("url")
+            if url:
+                items.append(MediaItem("photo", url))
+            continue
+        if media_type in {"video", "animated_gif"}:
+            url = _best_video_url(media)
+            if url:
+                items.append(MediaItem("video", url))
+    return items
+
+
+def _normalize_media_url(url: str) -> str:
+    cleaned = url.strip()
+    if cleaned.startswith("//"):
+        return f"https:{cleaned}"
+    return cleaned
+
+
+def _should_skip_image_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(hint in lowered for hint in SKIP_IMAGE_HINTS)
+
+
+def _extract_media_from_html(description: str) -> list[MediaItem]:
+    items: list[MediaItem] = []
+    seen: set[str] = set()
+
+    for match in VIDEO_SOURCE_RE.finditer(description):
+        url = _normalize_media_url(match.group(1))
+        if url not in seen:
+            seen.add(url)
+            items.append(MediaItem("video", url))
+
+    video_blocks = VIDEO_TAG_RE.findall(description)
+    for block in video_blocks:
+        poster_match = re.search(r'poster=["\']([^"\']+)["\']', block, re.IGNORECASE)
+        if poster_match:
+            url = _normalize_media_url(poster_match.group(1))
+            if url not in seen and not _should_skip_image_url(url):
+                seen.add(url)
+                items.append(MediaItem("photo", url))
+
+    for match in IMG_SRC_RE.finditer(description):
+        url = _normalize_media_url(match.group(1))
+        if url in seen or _should_skip_image_url(url):
+            continue
+        seen.add(url)
+        items.append(MediaItem("photo", url))
+
+    return items
 
 
 def _classify_text(body: str) -> tuple[str, str | None, str]:
@@ -165,27 +246,6 @@ def _classify_text(body: str) -> tuple[str, str | None, str]:
         return "reply", reply_match.group(1), stripped
 
     return "post", None, stripped
-
-
-def _extract_image_from_entities(item: dict, payload: dict | None = None) -> str | None:
-    media_by_key = {}
-    if payload:
-        media_by_key = {
-            media["media_key"]: media
-            for media in payload.get("includes", {}).get("media", [])
-            if media.get("media_key")
-        }
-    for media_key in item.get("attachments", {}).get("media_keys", []):
-        media = media_by_key.get(media_key, {})
-        preview = media.get("preview_image_url") or media.get("url")
-        if preview:
-            return preview
-
-    for media in item.get("entities", {}).get("urls", []):
-        expanded = media.get("expanded_url", "")
-        if "pic.twitter.com" in expanded or "pic.x.com" in expanded:
-            return expanded
-    return None
 
 
 def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
@@ -240,13 +300,14 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
     if not text:
         return None
 
+    media = _extract_media_items(source_item, payload) or _extract_media_items(item, payload)
+
     return Tweet(
         id=tweet_id,
         username=username,
         text=text,
         link=f"https://twitter.com/{username}/status/{tweet_id}",
-        image_url=_extract_image_from_entities(source_item, payload)
-        or _extract_image_from_entities(item, payload),
+        media=media,
         kind=kind,
         related_username=related_username,
     )
@@ -302,7 +363,7 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
                 username=username,
                 text=text,
                 link=f"https://twitter.com/{username}/status/{tweet_id}",
-                image_url=_extract_image_url(description) if description else None,
+                media=_extract_media_from_html(description) if description else [],
                 kind=kind,
                 related_username=related_username,
             )
@@ -408,7 +469,7 @@ async def fetch_tweets_x_api(
         f"?max_results={max(5, min(config['max_per_check'], 10))}"
         "&tweet.fields=created_at,entities,attachments,referenced_tweets,author_id,in_reply_to_user_id,text"
         "&expansions=attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id"
-        "&media.fields=preview_image_url,type,url"
+        "&media.fields=preview_image_url,type,url,variants"
         "&user.fields=username"
     )
     if since_id:

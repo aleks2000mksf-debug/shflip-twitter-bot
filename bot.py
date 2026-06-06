@@ -2,13 +2,14 @@ import asyncio
 import html
 import logging
 import re
-import sys
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import BufferedInputFile, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
+import aiohttp
 
-from twitter_poller import Tweet, check_twitter_accounts, load_config
+from twitter_poller import MediaItem, Tweet, check_twitter_accounts, load_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ PIC_URL_RE = re.compile(
     re.IGNORECASE,
 )
 TCO_URL_RE = re.compile(r"https?://t\.co/\w+", re.IGNORECASE)
+MEDIA_PLACEHOLDER_RE = re.compile(r"^(?:🎬\s*Видео|📷\s*Фото|Видео|Фото)$", re.MULTILINE)
 
 
 def _tidy_text(text: str) -> str:
@@ -125,31 +127,190 @@ def clean_tweet_text(text: str) -> str:
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     header = format_header(tweet)
     body = clean_tweet_text(tweet.text)
+    if tweet.media:
+        body = MEDIA_PLACEHOLDER_RE.sub("", body).strip()
+        body = clean_tweet_text(body)
     body = await translate_to_russian(body, proxy_url)
     body = clean_tweet_text(body)
-    quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
-    return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
+    if body:
+        quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
+        return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
+    return f"{header}\n\n{POST_FOOTER}"
 
 
 def create_bot(token: str, proxy_url: str | None) -> Bot:
     if proxy_url:
         logger.info("Using proxy for Telegram")
-        session = AiohttpSession(proxy=proxy_url, timeout=60)
+        session = AiohttpSession(proxy=proxy_url, timeout=120)
         return Bot(token=token, session=session)
-    return Bot(token=token, session=AiohttpSession(timeout=60))
+    return Bot(token=token, session=AiohttpSession(timeout=120))
+
+
+async def _download_media(url: str, proxy_url: str | None, filename: str) -> BufferedInputFile:
+    timeout = aiohttp.ClientTimeout(total=120)
+    if proxy_url:
+        try:
+            from aiohttp_socks import ProxyConnector
+
+            connector = ProxyConnector.from_url(proxy_url)
+            session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        except ImportError:
+            session = aiohttp.ClientSession(timeout=timeout)
+    else:
+        session = aiohttp.ClientSession(timeout=timeout)
+
+    async with session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            data = await response.read()
+    return BufferedInputFile(data, filename=filename)
+
+
+async def _media_input(
+    media_item: MediaItem,
+    proxy_url: str | None,
+    *,
+    allow_download: bool,
+):
+    if not allow_download:
+        return media_item.url
+
+    extension = "mp4" if media_item.kind == "video" else "jpg"
+    try:
+        return await _download_media(
+            media_item.url,
+            proxy_url,
+            filename=f"twitter_{media_item.kind}.{extension}",
+        )
+    except Exception:
+        logger.exception("Could not download media %s", media_item.url)
+        return media_item.url
+
+
+async def _send_video(
+    bot: Bot,
+    chat_id: str,
+    video_item: MediaItem,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    proxy_url: str | None,
+) -> None:
+    video = await _media_input(video_item, proxy_url, allow_download=True)
+    try:
+        await bot.send_video(
+            chat_id=chat_id,
+            video=video,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        return
+    except Exception:
+        if video == video_item.url:
+            raise
+        logger.warning("Retrying video upload after direct URL failed")
+        downloaded = await _media_input(video_item, proxy_url, allow_download=True)
+        await bot.send_video(
+            chat_id=chat_id,
+            video=downloaded,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+
+
+async def _send_photo(
+    bot: Bot,
+    chat_id: str,
+    photo_item: MediaItem,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    proxy_url: str | None,
+) -> None:
+    photo = await _media_input(photo_item, proxy_url, allow_download=False)
+    try:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        return
+    except Exception:
+        if photo != photo_item.url:
+            raise
+        logger.warning("Retrying photo upload after direct URL failed")
+        downloaded = await _media_input(photo_item, proxy_url, allow_download=True)
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=downloaded,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+
+
+async def _send_photo_album(
+    bot: Bot,
+    chat_id: str,
+    photos: list[MediaItem],
+    text: str,
+    markup: InlineKeyboardMarkup,
+    proxy_url: str | None,
+) -> None:
+    media_group: list[InputMediaPhoto] = []
+    for index, photo_item in enumerate(photos):
+        photo = await _media_input(photo_item, proxy_url, allow_download=False)
+        if index == 0:
+            media_group.append(
+                InputMediaPhoto(
+                    media=photo,
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                )
+            )
+        else:
+            media_group.append(InputMediaPhoto(media=photo))
+
+    try:
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
+    except Exception:
+        logger.warning("Retrying photo album with downloaded files")
+        media_group = []
+        for index, photo_item in enumerate(photos):
+            photo = await _media_input(photo_item, proxy_url, allow_download=True)
+            if index == 0:
+                media_group.append(
+                    InputMediaPhoto(
+                        media=photo,
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                )
+            else:
+                media_group.append(InputMediaPhoto(media=photo))
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="\u200b",
+        reply_markup=markup,
+    )
 
 
 async def send_tweet(bot: Bot, chat_id: str, tweet: Tweet, proxy_url: str | None) -> None:
     text = await format_tweet(tweet, proxy_url)
     markup = build_reply_markup(tweet)
-    if tweet.image_url:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=tweet.image_url,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-        )
+    photos = [item for item in tweet.media if item.kind == "photo"]
+    videos = [item for item in tweet.media if item.kind == "video"]
+
+    if videos:
+        await _send_video(bot, chat_id, videos[0], text, markup, proxy_url)
+    elif len(photos) == 1:
+        await _send_photo(bot, chat_id, photos[0], text, markup, proxy_url)
+    elif len(photos) > 1:
+        await _send_photo_album(bot, chat_id, photos, text, markup, proxy_url)
     else:
         await bot.send_message(
             chat_id=chat_id,
