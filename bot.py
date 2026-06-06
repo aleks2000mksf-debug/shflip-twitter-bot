@@ -47,11 +47,19 @@ POST_FOOTER = (
 CAPTION_LIMIT = 1024
 
 
+def _x_user_link(username: str) -> str:
+    profile = f"https://twitter.com/{username}"
+    return f'<a href="{html.escape(profile)}">@{html.escape(username)}</a>'
+
+
 def _assemble_tweet_text(header: str, body: str) -> str:
     if body:
         quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
         return f"{header}\n\n{quoted}\n\n{POST_FOOTER}"
     return f"{header}\n\n{POST_FOOTER}"
+
+
+def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
     if len(text) <= limit:
         return text
 
@@ -77,11 +85,6 @@ def _assemble_tweet_text(header: str, body: str) -> str:
         cut = re.sub(r"<[^>]*$", "", cut)
 
     return cut + "…"
-
-
-def trim_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
-    profile = f"https://twitter.com/{username}"
-    return f'<a href="{html.escape(profile)}">@{html.escape(username)}</a>'
 
 
 def format_header(tweet: Tweet) -> str:
