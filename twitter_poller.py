@@ -71,7 +71,7 @@ def load_config() -> dict:
         "check_interval": max(15, int(config.get("check_interval", 30))),
         "exclude_retweets": bool(config.get("exclude_retweets", False)),
         "exclude_replies": bool(config.get("exclude_replies", False)),
-        "max_per_check": int(config.get("max_tweets_per_check", 3)),
+        "max_per_check": max(5, int(config.get("max_tweets_per_check", 5))),
         "bootstrap": bool(config.get("bootstrap", True)),
         "keywords_filter": [item.lower() for item in config.get("keywords_filter", []) if item],
         "instances": [item.rstrip("/") for item in instances],
@@ -113,13 +113,26 @@ def save_cursors(cursors: dict[str, str]) -> None:
     CURSORS_FILE.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
 
 
-def _update_cursor(cursors: dict[str, str], username: str, tweets: list[Tweet]) -> None:
-    if not tweets:
-        return
-    newest = max(tweets, key=lambda tweet: int(tweet.id)).id
+def _update_cursor(cursors: dict[str, str], username: str, tweet_id: str) -> None:
     previous = cursors.get(username)
-    if not previous or int(newest) > int(previous):
-        cursors[username] = newest
+    if not previous or int(tweet_id) > int(previous):
+        cursors[username] = tweet_id
+
+
+def _media_label(item: dict, payload: dict) -> str | None:
+    media_by_key = {
+        media["media_key"]: media
+        for media in payload.get("includes", {}).get("media", [])
+        if media.get("media_key")
+    }
+    for media_key in item.get("attachments", {}).get("media_keys", []):
+        media = media_by_key.get(media_key, {})
+        media_type = media.get("type")
+        if media_type == "video" or media_type == "animated_gif":
+            return "🎬 Видео"
+        if media_type == "photo":
+            return "📷 Фото"
+    return None
 
 
 def _strip_html(html_text: str) -> str:
@@ -154,7 +167,20 @@ def _classify_text(body: str) -> tuple[str, str | None, str]:
     return "post", None, stripped
 
 
-def _extract_image_from_entities(item: dict) -> str | None:
+def _extract_image_from_entities(item: dict, payload: dict | None = None) -> str | None:
+    media_by_key = {}
+    if payload:
+        media_by_key = {
+            media["media_key"]: media
+            for media in payload.get("includes", {}).get("media", [])
+            if media.get("media_key")
+        }
+    for media_key in item.get("attachments", {}).get("media_keys", []):
+        media = media_by_key.get(media_key, {})
+        preview = media.get("preview_image_url") or media.get("url")
+        if preview:
+            return preview
+
     for media in item.get("entities", {}).get("urls", []):
         expanded = media.get("expanded_url", "")
         if "pic.twitter.com" in expanded or "pic.x.com" in expanded:
@@ -174,7 +200,10 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
 
     kind = "post"
     related_username: str | None = None
-    text = (item.get("text") or "").strip()
+    item_text = (item.get("text") or "").strip()
+    text = item_text
+    rt_match = RT_FULL_RE.match(item_text)
+    source_item = item
 
     for ref in item.get("referenced_tweets", []):
         ref_type = ref.get("type")
@@ -182,10 +211,13 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
         if ref_type == "retweeted" and ref_id:
             kind = "retweet"
             original = included_tweets.get(ref_id, {})
-            text = (original.get("text") or text).strip()
+            source_item = original or item
+            text = (original.get("text") or item_text).strip()
             author_id = original.get("author_id")
             if author_id:
                 related_username = users.get(author_id) or related_username
+            if not related_username and rt_match:
+                related_username = rt_match.group(1)
             break
         if ref_type == "replied_to":
             kind = "reply"
@@ -195,20 +227,26 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
         kind = "reply"
         related_username = users.get(in_reply_to) or related_username
 
+    if kind == "post":
+        parsed_kind, parsed_related, parsed_text = _classify_text(text)
+        if parsed_kind != "post":
+            kind = parsed_kind
+            text = parsed_text
+            related_username = parsed_related or related_username
+
+    if not text:
+        text = _media_label(source_item, payload) or _media_label(item, payload) or ""
+
     if not text:
         return None
-
-    if kind == "post":
-        kind, parsed_related, text = _classify_text(text)
-        if parsed_related:
-            related_username = parsed_related
 
     return Tweet(
         id=tweet_id,
         username=username,
         text=text,
         link=f"https://twitter.com/{username}/status/{tweet_id}",
-        image_url=_extract_image_from_entities(item),
+        image_url=_extract_image_from_entities(source_item, payload)
+        or _extract_image_from_entities(item, payload),
         kind=kind,
         related_username=related_username,
     )
@@ -367,9 +405,10 @@ async def fetch_tweets_x_api(
 
     url = (
         f"https://api.twitter.com/2/users/{user_id}/tweets"
-        f"?max_results={min(config['max_per_check'], 10)}"
-        "&tweet.fields=created_at,entities,referenced_tweets,author_id,in_reply_to_user_id,text"
-        "&expansions=referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id"
+        f"?max_results={max(5, min(config['max_per_check'], 10))}"
+        "&tweet.fields=created_at,entities,attachments,referenced_tweets,author_id,in_reply_to_user_id,text"
+        "&expansions=attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id"
+        "&media.fields=preview_image_url,type,url"
         "&user.fields=username"
     )
     if since_id:
@@ -421,7 +460,6 @@ async def check_twitter_accounts(
         async def fetch_account(username: str) -> tuple[str, list[Tweet]]:
             logger.info("Checking @%s...", username)
             tweets = await fetch_tweets(session, username, config, cursors.get(username))
-            _update_cursor(cursors, username, tweets)
             return username, tweets
 
         results = await asyncio.gather(
@@ -432,15 +470,16 @@ async def check_twitter_accounts(
                 tweet for tweet in tweets if tweet.id not in sent
             ]
 
-        save_cursors(cursors)
-
         if config["bootstrap"] and not sent:
             bootstrapped = sum(len(items) for items in pending_by_account.values())
             if bootstrapped:
-                for items in pending_by_account.values():
+                for username, items in pending_by_account.items():
                     for tweet in items:
                         sent.add(tweet.id)
+                    for tweet in items:
+                        _update_cursor(cursors, username, tweet.id)
                 save_sent(sent)
+                save_cursors(cursors)
                 logger.info("Bootstrap: marked %s existing tweets as seen", bootstrapped)
             return 0
 
@@ -448,19 +487,28 @@ async def check_twitter_accounts(
             if not fresh:
                 continue
 
-            for tweet in reversed(fresh):
+            for tweet in sorted(fresh, key=lambda item: int(item.id)):
                 if _should_skip_tweet(tweet, config):
                     sent.add(tweet.id)
+                    _update_cursor(cursors, username, tweet.id)
                     continue
 
                 try:
                     await on_new_tweet(tweet)
                     sent.add(tweet.id)
+                    _update_cursor(cursors, username, tweet.id)
                     new_count += 1
-                    logger.info("Sent tweet %s from @%s", tweet.id, username)
+                    logger.info(
+                        "Sent tweet %s from @%s (%s)",
+                        tweet.id,
+                        username,
+                        tweet.kind,
+                    )
                 except Exception:
                     logger.exception("Failed to send tweet %s from @%s", tweet.id, username)
+                    break
 
             save_sent(sent)
+            save_cursors(cursors)
 
     return new_count

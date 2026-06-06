@@ -52,10 +52,15 @@ def _x_user_link(username: str) -> str:
 
 def format_header(tweet: Tweet) -> str:
     author_link = _x_user_link(tweet.username)
-    if tweet.kind == "retweet" and tweet.related_username:
-        target_link = _x_user_link(tweet.related_username)
+    if tweet.kind == "retweet":
+        if tweet.related_username:
+            target_link = _x_user_link(tweet.related_username)
+            return (
+                f"🔁 <b>Репост · {target_link}</b>\n"
+                f"<i>от {author_link}</i>"
+            )
         return (
-            f"🔁 <b>Репост · {target_link}</b>\n"
+            f"🔁 <b>Репост</b>\n"
             f"<i>от {author_link}</i>"
         )
     if tweet.kind == "reply" and tweet.related_username:

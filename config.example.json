@@ -9,7 +9,7 @@
   "keywords_filter": [],
   "exclude_retweets": false,
   "exclude_replies": false,
-  "max_tweets_per_check": 3,
+  "max_tweets_per_check": 5,
   "bootstrap": true,
   "proxy_url": "",
   "nitter_url": "",
