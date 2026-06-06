@@ -5,6 +5,8 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -16,6 +18,9 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SENT_FILE = Path(__file__).parent / "sent_tweets.json"
 CURSORS_FILE = Path(__file__).parent / "account_cursors.json"
+INITIALIZED_FILE = Path(__file__).parent / "initialized_accounts.json"
+
+TWITTER_EPOCH_MS = 1288834974657
 
 _user_id_cache: dict[str, str] = {}
 
@@ -61,6 +66,7 @@ class Tweet:
     media: list[MediaItem] = field(default_factory=list)
     kind: str = "post"
     related_username: str | None = None
+    created_at: datetime | None = None
 
     @property
     def image_url(self) -> str | None:
@@ -96,6 +102,7 @@ def load_config() -> dict:
         "exclude_replies": bool(config.get("exclude_replies", False)),
         "exclude_quotes": bool(config.get("exclude_quotes", False)),
         "max_per_check": max(5, int(config.get("max_tweets_per_check", 5))),
+        "max_tweet_age_hours": max(1, int(config.get("max_tweet_age_hours", 3))),
         "bootstrap": bool(config.get("bootstrap", True)),
         "keywords_filter": [item.lower() for item in config.get("keywords_filter", []) if item],
         "instances": [item.rstrip("/") for item in instances],
@@ -135,6 +142,57 @@ def load_cursors() -> dict[str, str]:
 
 def save_cursors(cursors: dict[str, str]) -> None:
     CURSORS_FILE.write_text(json.dumps(cursors, indent=2), encoding="utf-8")
+
+
+def load_initialized() -> set[str]:
+    if not INITIALIZED_FILE.exists():
+        return set()
+    try:
+        data = json.loads(INITIALIZED_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {str(item).lower() for item in data}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read initialized_accounts.json: %s", exc)
+    return set()
+
+
+def save_initialized(accounts: set[str]) -> None:
+    INITIALIZED_FILE.write_text(
+        json.dumps(sorted(accounts), indent=2),
+        encoding="utf-8",
+    )
+
+
+def _parse_twitter_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _snowflake_to_datetime(tweet_id: str) -> datetime | None:
+    try:
+        timestamp_ms = (int(tweet_id) >> 22) + TWITTER_EPOCH_MS
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def tweet_created_at(tweet: Tweet) -> datetime | None:
+    if tweet.created_at:
+        return tweet.created_at
+    return _snowflake_to_datetime(tweet.id)
+
+
+def _is_stale_tweet(tweet: Tweet, max_age_hours: int) -> bool:
+    created = tweet_created_at(tweet)
+    if not created:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - created > timedelta(hours=max_age_hours)
 
 
 def _update_cursor(cursors: dict[str, str], username: str, tweet_id: str) -> None:
@@ -458,6 +516,7 @@ def _parse_x_api_item(item: dict, username: str, payload: dict) -> Tweet | None:
         media=media,
         kind=kind,
         related_username=related_username,
+        created_at=_parse_twitter_datetime(item.get("created_at")),
     )
 
 
@@ -519,6 +578,17 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
         if not text and media:
             text = "📎 Медиа"
 
+        published_at = None
+        for tag in ("pubDate", "published", "updated"):
+            raw_date = item.findtext(tag)
+            if raw_date:
+                try:
+                    published_at = parsedate_to_datetime(raw_date)
+                except (TypeError, ValueError):
+                    published_at = None
+                if published_at:
+                    break
+
         tweets.append(
             Tweet(
                 id=tweet_id,
@@ -528,6 +598,7 @@ def _parse_feed(xml_text: str, username: str) -> list[Tweet]:
                 media=_extract_media_from_html(description) if description else [],
                 kind=kind,
                 related_username=related_username,
+                created_at=published_at,
             )
         )
 
@@ -780,8 +851,10 @@ async def check_twitter_accounts(
 
     sent = load_sent()
     cursors = load_cursors()
+    initialized = load_initialized()
     new_count = 0
     pending_by_account: dict[str, list[Tweet]] = {}
+    initialized_changed = False
 
     async with await _create_session(config["proxy_url"]) as session:
         async def fetch_account(username: str) -> tuple[str, list[Tweet], str | None]:
@@ -793,8 +866,10 @@ async def check_twitter_accounts(
             *[fetch_account(username) for username in config["accounts"]]
         )
         for username, tweets, newest_id in results:
+            account_key = username.lower()
             pending = [tweet for tweet in tweets if tweet.id not in sent]
-            if username not in cursors:
+
+            if account_key not in initialized:
                 if tweets:
                     for tweet in tweets:
                         sent.add(tweet.id)
@@ -805,16 +880,20 @@ async def check_twitter_accounts(
                     )
                 elif newest_id:
                     _update_cursor(cursors, username, newest_id)
-                if username in cursors:
-                    save_sent(sent)
-                    save_cursors(cursors)
-                    logger.info(
-                        "Bootstrap @%s: skipped %s existing tweets (posts/reposts/replies)",
-                        username,
-                        len(tweets),
-                    )
-                    pending = []
+                initialized.add(account_key)
+                initialized_changed = True
+                save_sent(sent)
+                save_cursors(cursors)
+                logger.info(
+                    "First run @%s: skipped %s backlog tweets",
+                    username,
+                    len(tweets),
+                )
+                pending = []
             pending_by_account[username] = pending
+
+        if initialized_changed:
+            save_initialized(initialized)
 
         if config["bootstrap"] and not sent:
             bootstrapped = sum(len(items) for items in pending_by_account.values())
@@ -839,6 +918,17 @@ async def check_twitter_accounts(
                     _update_cursor(cursors, username, tweet.id)
                     continue
 
+                if _is_stale_tweet(tweet, config["max_tweet_age_hours"]):
+                    sent.add(tweet.id)
+                    _update_cursor(cursors, username, tweet.id)
+                    logger.info(
+                        "Skipped stale tweet %s from @%s (older than %sh)",
+                        tweet.id,
+                        username,
+                        config["max_tweet_age_hours"],
+                    )
+                    continue
+
                 try:
                     await on_new_tweet(tweet)
                     sent.add(tweet.id)
@@ -852,7 +942,12 @@ async def check_twitter_accounts(
                     )
                 except Exception:
                     logger.exception("Failed to send tweet %s from @%s", tweet.id, username)
-                    break
+                    if _is_stale_tweet(tweet, config["max_tweet_age_hours"]):
+                        sent.add(tweet.id)
+                        _update_cursor(cursors, username, tweet.id)
+                        logger.info("Marked stale tweet %s as seen after send failure", tweet.id)
+                    else:
+                        break
 
             save_sent(sent)
             save_cursors(cursors)

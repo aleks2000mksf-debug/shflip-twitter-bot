@@ -15,6 +15,7 @@
   "exclude_replies": false,
   "exclude_quotes": false,
   "max_tweets_per_check": 5,
+  "max_tweet_age_hours": 3,
   "bootstrap": true,
   "proxy_url": "",
   "nitter_url": "",
