@@ -26,12 +26,18 @@ async def translate_to_russian(text: str, proxy_url: str | None) -> str:
     return await asyncio.to_thread(_translate)
 
 
+POST_FOOTER = (
+    '<a href="https://t.me/pay2pass_bot?start=shflips_community">shflips community</a>'
+)
+
+
 async def format_tweet(tweet: Tweet, proxy_url: str | None) -> str:
     body = await translate_to_russian(tweet.text, proxy_url)
     quoted = f"<blockquote><b>{html.escape(body)}</b></blockquote>"
     return (
         f"{quoted}\n\n"
-        f'<a href="{html.escape(tweet.link)}">Открыть в X · @{html.escape(tweet.username)}</a>'
+        f'<a href="{html.escape(tweet.link)}">Открыть в X · @{html.escape(tweet.username)}</a>\n\n'
+        f"{POST_FOOTER}"
     )
 
 
